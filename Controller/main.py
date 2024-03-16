@@ -16,7 +16,7 @@ from importYoloPt import get_model
 from utils.ConfigReader import ConfigReader
 from utils.augmentations import letterbox
 from utils.general import check_img_size, non_max_suppression, scale_coords
-from utils.plots import Annotator, colors
+from utils.plots import Annotator
 
 model, device, half, stride, names = get_model()
 imgsz = check_img_size([640, 640], s=stride)
@@ -32,13 +32,14 @@ print(jwtConfigList)
 print(algorithm)
 WEIGHTS = 'weights/yolov5n.pt'
 IMGSZ = [640, 640]  # 图像尺寸
-CONF_THRES = 0.1  # 置信度阈值
+CONF_THRES = 0.3  # 置信度阈值
 IOU_THRES = 0.1  # IOU阈值
 MAX_DET = 1000  # 最大检测数量
 LINE_THICKNESS = 2  # 线条厚度
 HIDE_CONF = True  # 是否隐藏置信度
 HIDE_LABELS = None  # 是否隐藏标签
 IMGHOME = 'C:/Users/31391/Desktop/vueserver/images/'  # 图像保存路径
+
 
 def colors(index, bright=True):
     # A simple function to cycle colors based on index
@@ -77,8 +78,11 @@ def pred_img_optimized(img0, model, device, imgsz, stride, names, conf_thres, io
 
     return annotator.result()
 
-# --host="192.168.5.229"
-cap = cv2.VideoCapture("http://192.168.50.1:8080/?action=stream")
+
+# http://192.168.50.1:8080/?action=stream"
+cap = cv2.VideoCapture(0)
+
+
 async def decode_jwt(token: str):
     try:
         payload = jwt.decode(token, secretKey, algorithms=[algorithm])
@@ -133,5 +137,3 @@ async def store_and_fetch(value: str):
         return JSONResponse(content={"result": result})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-

@@ -17,7 +17,7 @@ from utils.ConfigReader import ConfigReader
 from utils.augmentations import letterbox
 from utils.general import check_img_size, non_max_suppression, scale_coords
 from utils.plots import Annotator
-
+import torchvision
 model, device, half, stride, names = get_model()
 imgsz = check_img_size([640, 640], s=stride)
 app = FastAPI()
@@ -32,51 +32,81 @@ print(jwtConfigList)
 print(algorithm)
 WEIGHTS = 'weights/yolov5n.pt'
 IMGSZ = [640, 640]  # 图像尺寸
-CONF_THRES = 0.3  # 置信度阈值
-IOU_THRES = 0.1  # IOU阈值
+CONF_THRES = 0.5  # 置信度阈值
+IOU_THRES = 0.2  # IOU阈值
 MAX_DET = 1000  # 最大检测数量
-LINE_THICKNESS = 2  # 线条厚度
-HIDE_CONF = True  # 是否隐藏置信度
+LINE_THICKNESS = 1  # 线条厚度
+HIDE_CONF = False  # 是否隐藏置信度
 HIDE_LABELS = None  # 是否隐藏标签
 IMGHOME = 'C:/Users/31391/Desktop/vueserver/images/'  # 图像保存路径
 
 
+class SmokingDecisionMaker:
+    def __init__(self, confirm_threshold=5):
+        self.confirm_threshold = confirm_threshold
+        self.smoking_streak = 0
+        self.smoking_confirmed = False
+
+    def update(self, detections):
+        if detections:
+            self.smoking_streak += 1
+
+        else:
+            self.smoking_streak = 0
+        if self.smoking_streak >= self.confirm_threshold:
+            self.smoking_confirmed = True
+        else:
+            self.smoking_confirmed = False
+
+    def reset(self):
+        self.smoking_streak = 0
+        self.smoking_confirmed = False
+
+    def is_smoking_confirmed(self):
+        return self.smoking_confirmed
+
+
+
 def colors(index, bright=True):
-    # A simple function to cycle colors based on index
-    color_list = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # Red, Green, Blue
+    color_list = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     return color_list[index % len(color_list)]
 
 
-def pred_img_optimized(img0, model, device, imgsz, stride, names, conf_thres, iou_thres, half=False,
-                       line_thickness=2, hide_labels=False, hide_conf=True, max_det=1000):
-    # Image preprocessing
-    img = letterbox(img0, new_shape=imgsz, auto=True)[0]  # Resize and pad
-    img = img.transpose((2, 0, 1))[::-1]  # BGR to RGB, to 3x416x416
+def pred_img_optimized(img0, model, device, imgsz, names, conf_thres, iou_thres, half,
+                       line_thickness, hide_labels, hide_conf, max_det):
+    img = letterbox(img0, new_shape=imgsz, auto=True)[0]
+    img = img.transpose((2, 0, 1))[::-1]
     img = np.ascontiguousarray(img)
-
     img = torch.from_numpy(img).to(device)
-    img = img.half() if half else img.float()  # Half precision
-    img = img / 255.0  # Normalize to [0, 1]
-    if len(img.shape) == 3:  # Add batch dimension
+    img = img.half() if half else img.float()
+    img = img / 255.0
+    if len(img.shape) == 3:
         img = img[None]
-
     im0 = img0.copy()
     annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-
-    # Inference
     pred = model(img, augment=False, visualize=False)[0]
     pred = non_max_suppression(pred, conf_thres, iou_thres, classes=None, agnostic=False, max_det=max_det)
+    detections = []
     det = pred[0]
     if len(det):
-        gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
         det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-
         for *xyxy, conf, cls in reversed(det):
-            c = int(cls)  # Class ID
-            label = None if hide_labels else (f'{names[c]} {conf:.2f}' if not hide_conf else names[c])
+            c = int(cls)
+            detections.append({'coords': tuple(map(int, xyxy)), 'confidence': conf})
+            if hide_labels:
+                label = None
+            else:
+                if not hide_conf:
+                    label = f'{names[c]} {conf:.2f}'
+                else:
+                    label = names[c]
             annotator.box_label(xyxy, label, color=colors(c))
 
-    return annotator.result()
+
+    else:
+        return img0, []
+
+    return annotator.result(), detections
 
 
 # http://192.168.50.1:8080/?action=stream"
@@ -93,11 +123,11 @@ async def decode_jwt(token: str):
             detail="Invalid JWT token",
         )
 
-
+decision_maker = SmokingDecisionMaker(confirm_threshold=15)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str) -> Any:
     try:
-        payload = await decode_jwt(token)  # 这里假设你有一个有效的JWT解码函数
+        payload = await decode_jwt(token)
     except HTTPException as e:
         print("鉴权失败")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -107,21 +137,21 @@ async def websocket_endpoint(websocket: WebSocket, token: str) -> Any:
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame")
-            break  # 如果无法获取帧，则跳出循环
+            print("图片处理异常")
+            break
 
-        # 调用pred_img_optimized()处理帧
-        processed_frame = pred_img_optimized(
-            frame, model, device, IMGSZ, stride, names, CONF_THRES, IOU_THRES, half,
+        processed_frame, data = pred_img_optimized(
+            frame, model, device, IMGSZ, names, CONF_THRES, IOU_THRES, half,
             LINE_THICKNESS, HIDE_LABELS, HIDE_CONF, MAX_DET
         )
-
-        # 编码处理后的帧以便传输
+        decision_maker.update(data)
+        if decision_maker.is_smoking_confirmed():
+            print("吸烟行为已确认")
+            decision_maker.reset()
         ret, buffer = cv2.imencode('.jpg', processed_frame)
         if not ret:
             print("Failed to encode frame")
-            continue  # 如果编码失败，继续下一次循环
-
+            continue
         frame_bytes = buffer.tobytes()
         await websocket.send_bytes(frame_bytes)
 

@@ -1,7 +1,9 @@
 from models.experimental import attempt_load
 from utils.torch_utils import select_device
 
-WEIGHTS = "D:\Smoke\SmokeDetectionMasterPython\smoke.pt"
+# WEIGHTS = "D:\Smoke\SmokeDetectionMasterPython\smoke.pt"
+WEIGHTS = "best.pt"
+
 def get_model():
     device = select_device('')
     half = device.type != 'cpu'

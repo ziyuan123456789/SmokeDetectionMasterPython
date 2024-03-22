@@ -1,9 +1,10 @@
 import asyncio
 import base64
+import threading
 import time
 from pyexpat import model
 from typing import List, Any
-import heartrate
+import asyncio
 import cv2
 import jwt
 import numpy as np
@@ -19,7 +20,10 @@ from utils.ConfigReader import ConfigReader
 from utils.augmentations import letterbox
 from utils.general import check_img_size, non_max_suppression, scale_coords
 from utils.plots import Annotator
+import requests
 
+# 小车的服务地址
+base_url = "http://192.168.137.213:8000"
 model, device, half, stride, names = get_model()
 imgsz = check_img_size([640, 640], s=stride)
 app = FastAPI()
@@ -40,14 +44,42 @@ MAX_DET = 1000  # 最大检测数量
 LINE_THICKNESS = 1  # 线条厚度
 HIDE_CONF = False  # 是否隐藏置信度
 HIDE_LABELS = None  # 是否隐藏标签
+# 其实一开始用的就是socket,当时是因为不知道http与socket有什么差别,导致"粘包"问题的出现,后来切换到了fastapi做小车服务器,但是树莓派性能差,每秒钟
+# 20+的http的消耗处理不了,于是又切换回了socket,并使用asyncio进一步优化,现在完全可用
+Host = '192.168.137.213'
+Port = 8000
 IMGHOME = 'C:/Users/31391/Desktop/vueserver/images/'  # 图像保存路径
 
-cache=[]
+writer = None
+
+
+async def connect_to_pi(host, port):
+    global writer
+    _, writer = await asyncio.open_connection(host, port)
+    print("树莓派,启动!")
+
+# 当系统启动时候先尝试连接socket
+@app.on_event("startup")
+async def startup_event():
+    await connect_to_pi(host=Host, port=Port)
+
+# 异步socket写入函数
+async def send_control_command(direction, angle):
+    global writer
+    if writer is None:
+        print("写入管道不存在")
+        return
+
+    command = f"{direction}/{angle}\n"
+    writer.write(command.encode())
+    await writer.drain()
+
+# 自定义标记窗颜色,由于rgb->bgr的存在,所以反着写
 def colors(index, bright=True):
     color_list = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     return color_list[index % len(color_list)]
 
-
+# 异步yolo推理主函数
 async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres, iou_thres, half,
                                    line_thickness, hide_labels, hide_conf, max_det):
     loop = asyncio.get_event_loop()
@@ -55,11 +87,11 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres
     def inference():
 
         img = letterbox(img0, new_shape=imgsz, auto=True)[0]
-        img = img.transpose((2, 0, 1))[::-1]  # BGR to RGB
+        img = img.transpose((2, 0, 1))[::-1]
         img = np.ascontiguousarray(img)
 
         img = torch.from_numpy(img).to(device)
-        img = img.half() if half else img.float()  # 半精度推理如果可用
+        img = img.half() if half else img.float()
         img /= 255.0  # 归一化
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
@@ -67,7 +99,6 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres
         im0 = img0.copy()
         annotator = Annotator(im0, line_width=line_thickness, example=str(names))
 
-        # 进行模型推理
         pred = model(img, augment=False, visualize=False)[0]
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes=None, agnostic=False, max_det=max_det)
 
@@ -76,8 +107,9 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres
         if len(det):
             det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
             for *xyxy, conf, cls in reversed(det):
-                c = int(cls)  # Class index
+                c = int(cls)
                 detections.append({'coords': tuple(map(int, xyxy)), 'confidence': conf.item()})
+
                 label = None if hide_labels else f'{names[c]} {conf:.2f}' if not hide_conf else names[c]
                 annotator.box_label(xyxy, label, color=colors(c))
 
@@ -86,9 +118,9 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres
     return await loop.run_in_executor(None, inference)
 
 
-# http://192.168.50.1:8080/?action=stream"
+# http://192.168.137.213:8080/?action=stream"
 
-
+# jwt解析判断是否登陆过期,后续加入鉴权
 async def decode_jwt(token: str):
     try:
         payload = jwt.decode(token, secretKey, algorithms=[algorithm])
@@ -100,26 +132,23 @@ async def decode_jwt(token: str):
         )
 
 
-decision_maker = SmokingDecisionMaker(confirm_threshold=45)
 
-cap = cv2.VideoCapture(0)
-fpsL = cap.get(cv2.CAP_PROP_FPS)
-print(f"摄像头帧率: {fpsL} FPS")
-
-
-# TEST_IMAGE_PATH = "1.jpg"
-# test_image = cv2.imread(TEST_IMAGE_PATH)
-
+# 异步从摄像头读取图片,避免阻塞,但是应该没啥鸟用
 async def capture_frame():
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, cap.read)
 
 
-# async def capture_frame():
-#     loop = asyncio.get_event_loop()
-#     return await loop.run_in_executor(None, lambda: (True, test_image))
+cache = []
+decision_maker = SmokingDecisionMaker(confirm_threshold=45)
 
+cap = cv2.VideoCapture("http://192.168.137.213:8080/?action=stream")
+fpsL = cap.get(cv2.CAP_PROP_FPS)
+print(f"摄像头帧率: {fpsL} FPS")
+angle_differences = []
+average_window = 7
 
+# 处理websocket的主函数
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str):
     global cache
@@ -129,6 +158,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         print("鉴权失败")
         await websocket.close(code=1008)
         return
+
     await websocket.accept()
 
     frame_count = 0
@@ -140,37 +170,61 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             print("Failed to capture frame")
             break
 
-        start_time = time.time()
         processed_frame, data = await pred_img_optimized_async(frame, model, device, IMGSZ, names, CONF_THRES,
                                                                IOU_THRES, half, LINE_THICKNESS, HIDE_LABELS, HIDE_CONF,
                                                                MAX_DET)
-        # end_time = time.time()
-        # inference_time_ms = (end_time - start_time) * 1000
-        # print(f"{inference_time_ms:.2f} 毫秒")
+        if data:
+            # 如果检测到了丁真行为则结合窗口坐标,原始图片大小,视角fov,压缩后图片大小进行计算中心点应该旋转多少度才能抵达中心
+            x1, y1, x2, y2 = data[0]['coords']
+            target_center_x = (x1 + x2) / 2  #
+            img_center_x = IMGSZ[0] / 2
+            angle_per_pixel = 50 / IMGSZ[0]
+            dx = target_center_x - img_center_x
+            angle_diff_x = int(dx * angle_per_pixel )
+            # 如果接近中心则不做任何行动,避免抽搐
+            if -2 <= angle_diff_x <= 2:
+                pass
+            else:
+                # 设计一个滑动窗口,平滑每一次的移动,一秒钟在我的2050上可以推理20fps,如果20次舵机转动指令直接给树莓派他反应不过来,于是做了一下平滑处理
+                angle_differences.append(angle_diff_x)
+                if len(angle_differences) > average_window:
+                    angle_differences.pop(0)
+                if len(angle_differences) == average_window:
+                    avg_angle_diff_x = sum(angle_differences) // average_window
+                    direction = "left" if avg_angle_diff_x > 0 else "right"
+                    turn_angle = abs(avg_angle_diff_x)
+                    await send_control_command(direction, turn_angle)
+                    angle_differences.clear()
+        # 设计了容错,如果连续抽烟15fps以上才算你抽烟,但实际上我想到了一个更好的方法但是这里地方太小我写不下了
         decision_maker.update(data)
         if decision_maker.is_smoking_confirmed():
             print("抽烟行为发生")
             cache.append(processed_frame)
-            if len(cache)>=2:
+            if len(cache) >= 2:
+                # 如果抽烟了那我还得判断是不是一个人站着一直抽,我目前只能实现比对图片相似度,以后在解决把
                 gray1 = cv2.cvtColor(cache[0], cv2.COLOR_BGR2GRAY)
                 gray2 = cv2.cvtColor(cache[1], cv2.COLOR_BGR2GRAY)
                 difference = cv2.absdiff(gray1, gray2)
                 euclidean_distance = np.linalg.norm(difference)
                 print("Euclidean Distance: ", euclidean_distance)
-                cache=[]
+                cache = []
+                # 最后应该存入数据库,日后补充
 
             decision_maker.reset()
+        # 实际上下面的imencode才是性能杀手,也就是瓶颈所在,我尝试使用ffmpeg+nginx做推流,但是性能更差,最后还是选择了websocket做法,避免每次的http请求的线程创建/请求头消耗
         ret, buffer = cv2.imencode('.jpg', processed_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         if not ret:
             print("Failed to encode frame")
             continue
+
         await websocket.send_bytes(buffer.tobytes())
 
         frame_count += 1
-        if (time.time() - start_time) >= 1:
-            fps = frame_count / (time.time() - start_time)
-            if fps < 30:
-                print(f"Average FPS: {fps:.2f}")
+        elapsed_time = time.time() - start_time
+        if elapsed_time >= 1:
+            fps = frame_count / elapsed_time
+            if fps <= 20:
+                print(f"平均帧数过低,当前为: {fps:.2f}")
             frame_count = 0
             start_time = time.time()
 

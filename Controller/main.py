@@ -5,6 +5,8 @@ import time
 from pyexpat import model
 from typing import List, Any
 import asyncio
+
+import aiomysql
 import cv2
 import jwt
 import numpy as np
@@ -12,6 +14,7 @@ import torch
 from fastapi import FastAPI, WebSocket, HTTPException, status
 from starlette.responses import JSONResponse
 
+from MysqlUtils.init import register_mysql
 from RedisUtils.init import register_redis
 from SmokingDecisionMaker import SmokingDecisionMaker
 from configList import *
@@ -20,7 +23,6 @@ from utils.ConfigReader import ConfigReader
 from utils.augmentations import letterbox
 from utils.general import check_img_size, non_max_suppression, scale_coords
 from utils.plots import Annotator
-import requests
 
 # 小车的服务地址
 base_url = "http://192.168.137.213:8000"
@@ -28,14 +30,20 @@ model, device, half, stride, names = get_model()
 imgsz = check_img_size([640, 640], s=stride)
 app = FastAPI()
 jwtConfigList: List = ConfigReader().read_section("Config.ini", "Jwt")
+mysqlConfigList: List = ConfigReader().read_section("Config.ini", "Mysql")
 redisConfigList: List = ConfigReader().read_section("Config.ini", "Redis")
 redisPort: int = int(ConfigReader().getValueBySection(redisConfigList, "port"))
 redisHost: str = ConfigReader().getValueBySection(redisConfigList, "host")
 secretKey: bytes = base64.b64decode(ConfigReader().getValueBySection(jwtConfigList, "secretkey"))
 algorithm: str = ConfigReader().getValueBySection(jwtConfigList, "algorithm")
+DBHOST: str = ConfigReader().getValueBySection(mysqlConfigList, "host")
+DBPORT: int = int(ConfigReader().getValueBySection(mysqlConfigList, "port"))
+USER: str = ConfigReader().getValueBySection(mysqlConfigList, "user")
+PASSWORD: str = ConfigReader().getValueBySection(mysqlConfigList, "password")
+DB: str = ConfigReader().getValueBySection(mysqlConfigList, "db")
+
 register_redis(app, redisPort, redisHost)
-print(jwtConfigList)
-print(algorithm)
+register_mysql(app, DBHOST, DBPORT, USER, PASSWORD, DB)
 WEIGHTS = 'weights/yolov5n.pt'
 IMGSZ = [640, 640]  # 图像尺寸
 CONF_THRES = 0.5  # 置信度阈值
@@ -58,10 +66,12 @@ async def connect_to_pi(host, port):
     _, writer = await asyncio.open_connection(host, port)
     print("树莓派,启动!")
 
+
 # 当系统启动时候先尝试连接socket
-@app.on_event("startup")
-async def startup_event():
-    await connect_to_pi(host=Host, port=Port)
+# @app.on_event("startup")
+# async def startup_event():
+#     await connect_to_pi(host=Host, port=Port)
+
 
 # 异步socket写入函数
 async def send_control_command(direction, angle):
@@ -74,10 +84,12 @@ async def send_control_command(direction, angle):
     writer.write(command.encode())
     await writer.drain()
 
+
 # 自定义标记窗颜色,由于rgb->bgr的存在,所以反着写
 def colors(index, bright=True):
     color_list = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     return color_list[index % len(color_list)]
+
 
 # 异步yolo推理主函数
 async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres, iou_thres, half,
@@ -124,6 +136,7 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, conf_thres
 async def decode_jwt(token: str):
     try:
         payload = jwt.decode(token, secretKey, algorithms=[algorithm])
+        print(payload)
         return payload
     except:
         raise HTTPException(
@@ -132,28 +145,64 @@ async def decode_jwt(token: str):
         )
 
 
-
 # 异步从摄像头读取图片,避免阻塞,但是应该没啥鸟用
 async def capture_frame():
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, cap.read)
 
 
+async def face_distance_async(frame1, frame2):
+    import face_recognition
+
+    encoding1 = await asyncio.to_thread(face_recognition.face_encodings, frame1)
+    encoding2 = await asyncio.to_thread(face_recognition.face_encodings, frame2)
+
+    if encoding1 and encoding2:
+        results = face_recognition.compare_faces([encoding1[0]], encoding2[0])
+        if results[0]:
+            print("是一个人哦")
+        else:
+            print("不是一个人")
+    else:
+        print("至少有一个图像中没有检测到脸部")
+
+        # 最后应该存入数据库,日后补充
+
+
+async def is_blacklisted(jwt_id: str) -> bool:
+    """
+    检查JWT ID是否被拉黑（即存在于Redis中）。
+    """
+    exists = await app.state.redis.exists(jwt_id)
+    return exists == 1  # 如果存在，返回True
+
+
+
+
+
 cache = []
 decision_maker = SmokingDecisionMaker(confirm_threshold=45)
-
-cap = cv2.VideoCapture("http://192.168.137.213:8080/?action=stream")
+# "http://192.168.137.213:8080/?action=stream"
+cap = cv2.VideoCapture(0)
 fpsL = cap.get(cv2.CAP_PROP_FPS)
 print(f"摄像头帧率: {fpsL} FPS")
 angle_differences = []
 average_window = 7
 
+
 # 处理websocket的主函数
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str):
+    print(token)
+    if await is_blacklisted(token):  # 使用 await 获取异步函数的返回值
+        print("jwt被拉黑")
+        await websocket.close(code=1008)
+        return
     global cache
     try:
         payload = await decode_jwt(token)
+
+
     except Exception as e:
         print("鉴权失败")
         await websocket.close(code=1008)
@@ -180,7 +229,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
             img_center_x = IMGSZ[0] / 2
             angle_per_pixel = 50 / IMGSZ[0]
             dx = target_center_x - img_center_x
-            angle_diff_x = int(dx * angle_per_pixel )
+            angle_diff_x = int(dx * angle_per_pixel)
             # 如果接近中心则不做任何行动,避免抽搐
             if -2 <= angle_diff_x <= 2:
                 pass
@@ -193,22 +242,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     avg_angle_diff_x = sum(angle_differences) // average_window
                     direction = "left" if avg_angle_diff_x > 0 else "right"
                     turn_angle = abs(avg_angle_diff_x)
-                    await send_control_command(direction, turn_angle)
+                    # await send_control_command(direction, turn_angle)
                     angle_differences.clear()
         # 设计了容错,如果连续抽烟15fps以上才算你抽烟,但实际上我想到了一个更好的方法但是这里地方太小我写不下了
         decision_maker.update(data)
         if decision_maker.is_smoking_confirmed():
             print("抽烟行为发生")
-            cache.append(processed_frame)
+            cache.append(frame)
             if len(cache) >= 2:
-                # 如果抽烟了那我还得判断是不是一个人站着一直抽,我目前只能实现比对图片相似度,以后在解决把
-                gray1 = cv2.cvtColor(cache[0], cv2.COLOR_BGR2GRAY)
-                gray2 = cv2.cvtColor(cache[1], cv2.COLOR_BGR2GRAY)
-                difference = cv2.absdiff(gray1, gray2)
-                euclidean_distance = np.linalg.norm(difference)
-                print("Euclidean Distance: ", euclidean_distance)
+                # 异步计算两帧之间的人脸相似度,如果是一个人就认为再连续抽烟,原则上只需报警一次
+                asyncio.create_task(face_distance_async(cache[0], cache[1]))
                 cache = []
-                # 最后应该存入数据库,日后补充
 
             decision_maker.reset()
         # 实际上下面的imencode才是性能杀手,也就是瓶颈所在,我尝试使用ffmpeg+nginx做推流,但是性能更差,最后还是选择了websocket做法,避免每次的http请求的线程创建/请求头消耗
@@ -240,3 +284,12 @@ async def store_and_fetch(value: str):
         return JSONResponse(content={"result": result})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/items")
+async def read_items():
+    async with app.state.mysql_pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute("SELECT * FROM user")
+            result = await cur.fetchall()
+            return result

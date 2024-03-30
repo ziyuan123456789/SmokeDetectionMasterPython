@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 import aiomysql
 
+
 def register_mysql(app: FastAPI, host: str, port: int, user: str, password: str, db: str):
     @app.on_event("startup")
     async def startup_event() -> None:

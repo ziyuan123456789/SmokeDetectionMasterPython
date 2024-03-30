@@ -2,19 +2,6 @@ import aioredis
 from fastapi import FastAPI
 import aiomysql
 
-def register_redis(app: FastAPI, redisPort: int, redisHost: str):
-    @app.on_event("startup")
-    async def startup_event() -> None:
-        app.state.redis = await aioredis.Redis(host=redisHost, port=redisPort, db=3, encoding="utf-8")
-        print(f"redis成功--->>{app.state.redis}")
-
-    @app.on_event("shutdown")
-    async def shutdown_event() -> None:
-        print("redis关闭")
-        await app.state.redis.close()
-import aioredis
-from fastapi import FastAPI
-
 
 def register_redis(app: FastAPI, port: int, host: str):
     async def redis_pool():
@@ -30,6 +17,4 @@ def register_redis(app: FastAPI, port: int, host: str):
 
     @app.on_event("shutdown")
     async def shutdown_event():
-        app.state.redis.close()
-        await app.state.redis.wait_closed()
-
+        await app.state.redis.close()

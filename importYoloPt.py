@@ -1,7 +1,7 @@
 from models.experimental import attempt_load
 from utils.torch_utils import select_device
 
-# WEIGHTS = "D:\Smoke\SmokeDetectionMasterPython\smoke.pt"
+# WEIGHTS = "D:/Smoke/SmokeDetectionMasterPython/quantized_model.pt"
 WEIGHTS = "D:/BaiduNetdiskDownload/smoking_calling_weight/exp2052/weights/best.pt"
 
 

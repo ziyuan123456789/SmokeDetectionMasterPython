@@ -34,7 +34,6 @@ class ConfigReader:
         config = configparser.ConfigParser()
         config.read(file_path)
         section_data = []
-        print(file_path)
         if config.has_section(section):
             items = config.items(section)
             for item in items:

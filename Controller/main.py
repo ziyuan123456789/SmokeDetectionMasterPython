@@ -1,10 +1,9 @@
-import asyncio
 import base64
 import os
 import time
-from pyexpat import model
-from typing import List, Any, Callable
 import asyncio
+from typing import List
+
 import aiomysql
 import cv2
 import jwt
@@ -12,31 +11,32 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, HTTPException, status, Request
-from line_profiler import profile
-from pyinstrument.renderers import SpeedscopeRenderer, HTMLRenderer
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from concurrent.futures import ThreadPoolExecutor
 from MysqlUtils.init import register_mysql
 from RedisUtils.init import register_redis
 from SmokingDecisionMaker import SmokingDecisionMaker
-from configList import *
 from importYoloPt import get_model
 from utils.ConfigReader import ConfigReader
 from utils.augmentations import letterbox
 from utils.general import check_img_size, non_max_suppression, scale_coords
 from utils.plots import Annotator
 from pyinstrument import Profiler
+# 如果解释器在一开始就加载face_recognition可能会启动失败,这时候就需要把face_recognition放到异步方法中import,保证服务器正常启动.但这样会导致第一次检测到人脸时卡顿一下.不过放心,不会call一次导入一次的
+import face_recognition
 
+# 如果想用main.py直接启动uvicorn则需要制定一下运行时环境,要不然找到不到包和配置文件
 project_root_directory = 'D:\\Smoke\\SmokeDetectionMasterPython'
 os.chdir(project_root_directory)
 # 小车的服务地址
 base_url = "http://192.168.137.213:8000"
-model, device, half, stride, names = get_model()
 app = FastAPI()
 jwtConfigList: List = ConfigReader().read_section("Config.ini", "Jwt")
 mysqlConfigList: List = ConfigReader().read_section("Config.ini", "Mysql")
 redisConfigList: List = ConfigReader().read_section("Config.ini", "Redis")
+fileHomeConfigList: List = ConfigReader().read_section("Config.ini", "FileHome")
+print(fileHomeConfigList)
 redisPort: int = int(ConfigReader().getValueBySection(redisConfigList, "port"))
 redisHost: str = ConfigReader().getValueBySection(redisConfigList, "host")
 secretKey: bytes = base64.b64decode(ConfigReader().getValueBySection(jwtConfigList, "secretkey"))
@@ -46,11 +46,13 @@ DBPORT: int = int(ConfigReader().getValueBySection(mysqlConfigList, "port"))
 USER: str = ConfigReader().getValueBySection(mysqlConfigList, "user")
 PASSWORD: str = ConfigReader().getValueBySection(mysqlConfigList, "password")
 DB: str = ConfigReader().getValueBySection(mysqlConfigList, "db")
+modelhome: str = ConfigReader().getValueBySection(fileHomeConfigList, "modelhome")
+pichome: str = ConfigReader().getValueBySection(fileHomeConfigList, "pichome")
+model, device, half, stride, names = get_model(modelhome)
 register_redis(app, redisPort, redisHost)
 register_mysql(app, DBHOST, DBPORT, USER, PASSWORD, DB)
-IMGSZ = [256, 256]  # 图像尺寸
-CONF_THRES = 0.5  # 置信度阈值
-IOU_THRES = 0.2  # IOU阈值
+IMGSZ = [512, 512]  # 图像尺寸,512这个尺寸能让cuda占用率到90+,而且准确性非常好,其实128128也可也就是检测偏移严重
+IOU_THRES = 0.4  # IOU阈值
 MAX_DET = 1000  # 最大检测数量
 LINE_THICKNESS = 1  # 线条厚度
 HIDE_CONF = False  # 是否隐藏置信度
@@ -104,7 +106,7 @@ async def send_control_command(direction, angle):
     if writer is None:
         print("写入管道不存在")
         return
-
+    # 自定义传输规则,使用转义符分割
     command = f"{direction}/{angle}\n"
     writer.write(command.encode())
     await writer.drain()
@@ -129,7 +131,7 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, territoryI
 
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()
-        img /= 255.0  # 归一化
+        img /= 255.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
@@ -145,7 +147,8 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, territoryI
             det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
             for *xyxy, conf, cls in reversed(det):
                 c = int(cls)
-                if c == 0:  # 检查类别是否为smoking,输出层"剪枝"
+                # 检查类别是否为smoking,输出层"剪枝"
+                if c == 0:
                     detections.append({'coords': tuple(map(int, xyxy)), 'confidence': conf.item()})
                     label = None if hide_labels else f'{names[c]} {conf:.2f}' if not hide_conf else names[c]
                     annotator.box_label(xyxy, label, color=colors(c))
@@ -157,7 +160,7 @@ async def pred_img_optimized_async(img0, model, device, imgsz, names, territoryI
 
 # http://192.168.137.213:8080/?action=stream"
 
-# jwt解析判断是否登陆过期,后续加入鉴权
+# jwt解析判断是否登陆过期/篡改
 async def decode_jwt(token: str):
     try:
         payload = jwt.decode(token, secretKey, algorithms=[algorithm])
@@ -170,7 +173,7 @@ async def decode_jwt(token: str):
 
 
 # 异步从摄像头读取图片,避免阻塞,在单用户下无用但是多用户可用平滑帧率
-executor = ThreadPoolExecutor(max_workers=6)
+executor = ThreadPoolExecutor(max_workers=4)
 
 
 async def capture_frame0():
@@ -186,19 +189,41 @@ async def capture_frame1():
 face_data_map = {}
 MAX_FACE_DATA_PER_ID = 20
 
+EXPIRE_TIME_SECONDS = 900  # 15分钟
+
+
+class FaceData:
+    def __init__(self, encoding, timestamp):
+        self.encoding = encoding
+        self.timestamp = timestamp
+
+
+async def saveImageWithPath(territoryId: int) -> str:
+    territory_dir = os.path.join(pichome, str(territoryId))
+    os.makedirs(territory_dir, exist_ok=True)
+
+    # 当前年份
+    year = str(time.localtime().tm_year)
+    year_dir = os.path.join(territory_dir, year)
+    os.makedirs(year_dir, exist_ok=True)
+
+    # 当前日期
+    month = str(time.localtime().tm_mon)
+    day = str(time.localtime().tm_mday)
+    date_dir = os.path.join(year_dir, f"{month}-{day}")
+    os.makedirs(date_dir, exist_ok=True)
+
+    # 图片文件名
+    file_name = f"smoke_face_{territoryId}_{int(time.time())}.jpg"
+    return os.path.join(date_dir, file_name)
+
 
 async def face_distance_async(territoryId: int, frame):
-    import face_recognition
-    rgb_frame = frame[:, :, ::-1]
+    global face_data_map
+
     face_encodings = face_recognition.face_encodings(frame)
     if not face_encodings:
-        file_name = f"no_face_{territoryId}_{int(time.time())}.jpg"
-        file_path = os.path.join("D:/Smoke/PictureHome/9/2023/1-25", file_name)
-
-        # 保存图像
-        cv2.imwrite(file_path, frame)
         print("在当前帧中没有检测到人脸")
-
         return
 
     face_encoding = face_encodings[0]
@@ -206,17 +231,25 @@ async def face_distance_async(territoryId: int, frame):
 
     # 逐一比对当前帧的人脸与已知的人脸
     for index, existing_face in enumerate(face_list):
-        match = face_recognition.compare_faces([existing_face], face_encoding, tolerance=0.6)
+        match = face_recognition.compare_faces([existing_face.encoding], face_encoding, tolerance=0.6)
         if match[0]:
             print(f"辖区 {territoryId}: 找到了相同的人脸, 索引 {index}")
             return
 
-    # 如果没有找到相同的人脸，则添加到队列中
+    # 如果没有找到相同的人脸，则添加到栈中
+    current_time = time.time()
     if len(face_list) >= MAX_FACE_DATA_PER_ID:
-        face_list.pop(0)  # 如果队列已满，则删除最早的数据
-    face_list.append(face_encoding)
+        expired_faces = [face for face in face_list if current_time - face.timestamp > EXPIRE_TIME_SECONDS]
+        for expired_face in expired_faces:
+            face_list.remove(expired_face)
+        if len(face_list) >= MAX_FACE_DATA_PER_ID:
+            face_list.pop()  # 如果队列仍然满足最大容量，则弹出最早的数据
+    face_list.append(FaceData(face_encoding, current_time))
     face_data_map[territoryId] = face_list
     print(f"辖区 {territoryId}: 检测到新的人脸, 已添加到队列")
+    path = await saveImageWithPath(territoryId)
+    if path is not None:
+        cv2.imwrite(path, frame)
 
 
 async def is_blacklisted(jwt_id: str) -> bool:
@@ -238,10 +271,13 @@ async def is_user_authorized(user_id: int, territoryId: int) -> bool:
 
 
 # "http://192.168.137.213:8080/?action=stream"
-cap1 = cv2.VideoCapture(1)
+cap1 = cv2.VideoCapture(1, cv2.CAP_DSHOW)
 cap1.set(6, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
-cap0 = cv2.VideoCapture(0)
+# 如果不加入cv2.CAP_DSHOW则设置分辨率会有偏移
+cap0 = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 cap0.set(6, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
+cap0.set(cv2.CAP_PROP_FRAME_WIDTH, 1200)
+cap0.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 fpsL = cap1.get(cv2.CAP_PROP_FPS)
 print(f"摄像头1帧率: {fpsL} FPS")
 fpsL2 = cap0.get(cv2.CAP_PROP_FPS)
@@ -251,7 +287,6 @@ average_window = 7
 
 
 # 处理websocket的主函数
-@profile
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str, territoryId: int):
     decision_maker = SmokingDecisionMaker(confirm_threshold=20)
@@ -284,6 +319,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, territoryId: int)
             # 其实应该在连接时确认而不是检测时确认,但是在这个方法里还不能先定义在后面await,我也不知道为什么.不过比较一个变量的消耗可忽略不计
             if territoryId == 9:
                 ret, frame = await capture_frame1()
+
             else:
                 ret, frame = await capture_frame0()
             if not ret:
@@ -337,7 +373,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, territoryId: int)
             elapsed_time = time.time() - start_time
             if elapsed_time >= 1:
                 fps = frame_count / elapsed_time
-                if fps < 7:
+                if fps < 15:
                     print(f"当前{territoryId}辖区帧率过低为: {fps:.2f}")
                 frame_count = 0
                 start_time = time.time()
@@ -378,7 +414,7 @@ def is_localhost(request: Request):
 @app.get("/changeUserTerritoryConfidenceLevel")
 async def changeUserTerritoryConfidenceLevel(request: Request, territoryId: int, confidenceLevel: float):
     if not is_localhost(request):
-        raise HTTPException(status_code=403, detail="仅回环地址访问")
+        raise HTTPException(status_code=403, detail="仅限回环地址访问")
 
     global userConfig
     if territoryId in userConfig:

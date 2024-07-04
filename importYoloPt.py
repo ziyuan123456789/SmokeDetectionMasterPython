@@ -1,13 +1,10 @@
+import torch
+
 from models.experimental import attempt_load
 from utils.torch_utils import select_device
 
 
-# WEIGHTS = "D:/Smoke/SmokeDetectionMasterPython/quantized_model.pt"
-# WEIGHTS = "D:/BaiduNetdiskDownload/smoking_calling_weight/exp2052/weights/best.pt"
-
-
 def get_model(WEIGHTS: str):
-
     device = select_device('')
     half = device.type != 'cpu'
     model = attempt_load(WEIGHTS, map_location=device)
@@ -15,4 +12,8 @@ def get_model(WEIGHTS: str):
     names = model.module.names if hasattr(model, 'module') else model.names
     if half:
         model.half()
+    model.eval()
+    with torch.no_grad():
+        warmup_input = torch.rand(1, 3, stride * 32, stride * 32).to(device).type_as(next(model.parameters()))
+        model(warmup_input.half() if half else warmup_input)
     return model, device, half, stride, names
